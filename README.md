@@ -8,6 +8,16 @@ M5Atom Matrix に Unit ENV III (SHT30 + QMP6988) をつなぎ、
 
 するファームウェアです。PlatformIO でビルドします。
 
+## スクリーンショット
+
+| ダッシュボード | 設定画面 |
+| --- | --- |
+| ![ダッシュボード](docs/images/dashboard.png) | ![設定画面](docs/images/settings.png) |
+
+スプレッドシートへの記録
+
+![スプレッドシート](docs/images/spreadsheet.png)
+
 ## 配線
 
 ENV III を Atom Matrix の Grove ポートに挿すだけです (SDA=G26, SCL=G32)。

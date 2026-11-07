@@ -299,10 +299,29 @@ void setUploadStatus(bool ok, int code, const char* message) {
   xSemaphoreGive(uploadMutex);
 }
 
-bool postToGas(const Reading& r) {
+enum class UploadResult {
+  kOk,
+  kRejected,  // GAS には届いたが拒否された (合言葉違いなど)。再送しても変わらない
+  kFailed,    // 通信エラーなど。再送する
+};
+
+// GAS の doPost の結果ページ (302 の Location) を取りに行く
+int fetchGasResult(const String& location, String& response) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, location)) return HTTPC_ERROR_CONNECTION_REFUSED;
+  int code = http.GET();
+  response = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+  http.end();
+  return code;
+}
+
+UploadResult postToGas(const Reading& r) {
   if (!WiFi.isConnected()) {
     setUploadStatus(false, 0, "wifi disconnected");
-    return false;
+    return UploadResult::kFailed;
   }
 
   xSemaphoreTake(uploadMutex, portMAX_DELAY);
@@ -311,7 +330,7 @@ bool postToGas(const Reading& r) {
   xSemaphoreGive(uploadMutex);
   if (url.isEmpty()) {
     setUploadStatus(false, 0, "GAS URL is not set");
-    return false;
+    return UploadResult::kRejected;
   }
 
   char body[384];
@@ -321,25 +340,54 @@ bool postToGas(const Reading& r) {
            jsonString(token).c_str(), DEVICE_NAME, r.temperature, r.humidity, r.pressure, WiFi.RSSI(),
            (unsigned long)uptimeSec());
 
-  WiFiClientSecure client;
-  client.setInsecure();  // 証明書の検証は省略 (送るのは測定値のみ)
-  HTTPClient http;
-  // GAS は 302 でリダイレクトして結果を返すので GET で追いかける
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(20000);
-  if (!http.begin(client, url)) {
-    setUploadStatus(false, 0, "invalid GAS URL");
-    return false;
+  // GAS は doPost を実行してから 302 で結果の URL を返す。HTTPClient に自動で追わせると
+  // POST 用の Content-Type を付けたまま GET してしまい 400 になるので、結果は別リクエストで取る。
+  int code;
+  String response;
+  String location;
+  {
+    WiFiClientSecure client;
+    client.setInsecure();  // 証明書の検証は省略 (送るのは測定値のみ)
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.setTimeout(20000);
+    const char* headerKeys[] = {"Location"};
+    http.collectHeaders(headerKeys, 1);
+    if (!http.begin(client, url)) {
+      setUploadStatus(false, 0, "invalid GAS URL");
+      return UploadResult::kRejected;
+    }
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST((uint8_t*)body, strlen(body));
+    if (code == HTTP_CODE_FOUND || code == HTTP_CODE_SEE_OTHER) {
+      location = http.header("Location");
+    } else {
+      response = code > 0 ? http.getString() : HTTPClient::errorToString(code);
+    }
+    http.end();
   }
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST((uint8_t*)body, strlen(body));
-  String response = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-  http.end();
 
-  bool ok = code == 200 && response.indexOf("\"ok\":true") >= 0;
-  Serial.printf("[upload] code=%d %s\n", code, response.substring(0, 120).c_str());
-  setUploadStatus(ok, code, ok ? "ok" : response.substring(0, 90).c_str());
-  return ok;
+  if (location.length() > 0) {
+    int resultCode = fetchGasResult(location, response);
+    Serial.printf("[upload] 302 -> %d %s\n", resultCode, response.substring(0, 120).c_str());
+    if (resultCode != HTTP_CODE_OK) {
+      // 302 が返った時点で doPost は実行済み。再送すると行が重複するので成功扱いにする
+      setUploadStatus(true, code, "ok (result not read)");
+      return UploadResult::kOk;
+    }
+    code = resultCode;
+  } else {
+    Serial.printf("[upload] code=%d %s\n", code, response.substring(0, 120).c_str());
+  }
+
+  if (code == HTTP_CODE_OK && response.indexOf("\"ok\":true") >= 0) {
+    setUploadStatus(true, code, "ok");
+    return UploadResult::kOk;
+  }
+  // HTML のエラーページはそのまま見せても読めないので要約する
+  String message = response.startsWith("<") ? "HTTP " + String(code) + " (html)" : response.substring(0, 90);
+  setUploadStatus(false, code, message.c_str());
+  return code == HTTP_CODE_OK ? UploadResult::kRejected : UploadResult::kFailed;
 }
 
 void uploadTask(void*) {
@@ -347,7 +395,7 @@ void uploadTask(void*) {
   for (;;) {
     if (xQueueReceive(uploadQueue, &r, portMAX_DELAY) != pdTRUE) continue;
     for (int attempt = 0; attempt < 3; ++attempt) {
-      if (postToGas(r)) break;
+      if (postToGas(r) != UploadResult::kFailed) break;
       // 30秒待って再送。新しい送信要求が来たらそちらを優先する。
       Reading newer;
       if (xQueuePeek(uploadQueue, &newer, pdMS_TO_TICKS(30000)) == pdTRUE) break;

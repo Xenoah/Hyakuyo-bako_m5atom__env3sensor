@@ -6,6 +6,7 @@
 const char STYLE_CSS[] PROGMEM = R"CSS(:root{color-scheme:dark;--bg:#0d0f14;--card:#171a22;--line:#262b36;--text:#e8eaf0;--sub:#8a91a3;
 --t:#ff2d95;--h:#00e5ff;--p:#39ff14;--ok:#39ff14;--ng:#ff4d4d}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif}
 main{max-width:980px;margin:0 auto;padding:16px}
 header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}
