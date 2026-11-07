@@ -2,44 +2,22 @@
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
-#include <HTTPClient.h>
-#include <M5UnitENV.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <Wire.h>
 #include <time.h>
 
 #include "config.h"
+#include "history.h"
+#include "json_util.h"
 #include "matrix_display.h"
+#include "sensors/env3_sensor.h"
 #include "settings.h"
+#include "uploader.h"
 #include "web_page.h"
 
 namespace {
-
-struct Reading {
-  float temperature = NAN;  // °C
-  float humidity = NAN;     // %RH
-  float pressure = NAN;     // hPa
-  bool valid = false;
-};
-
-struct HistoryEntry {
-  uint32_t uptimeSec;
-  float temperature;
-  float humidity;
-  float pressure;
-};
-
-// 時刻は NTP 同期前でも扱えるよう起動からの秒数で持ち、表示時に実時刻へ換算する。
-struct UploadStatus {
-  uint32_t lastAttemptSec = 0;  // 0 = まだ
-  uint32_t lastSuccessSec = 0;
-  int lastCode = 0;
-  char message[96] = "waiting";
-  uint32_t successCount = 0;
-  uint32_t failureCount = 0;
-};
 
 class Button {
  public:
@@ -85,35 +63,31 @@ MatrixDisplay display(PIN_LED);
 Button button(PIN_BUTTON);
 WebServer server(80);
 Preferences prefs;
-SHT3X sht3x;
-QMP6988 qmp;
 
-bool sensorOk = false;
-uint32_t lastSensorInitMs = 0;
+// センサー。ここに追加して setup() で sensors.add() すれば、
+// マトリクス・Web・履歴・CSV・GAS 送信に自動で載る (README「センサーの追加」参照)。
+SensorHub sensors;
+Env3Sensor env3(Wire, PIN_SDA, PIN_SCL);
+
 uint32_t lastSensorReadMs = 0;
-uint8_t sensorFailures = 0;
-Reading reading;
-
-HistoryEntry history[HISTORY_SIZE];
-size_t historyHead = 0;  // 次に書き込む位置
-size_t historyCount = 0;
+History history;
+bool historyStarted = false;
 uint32_t lastHistorySec = 0;
 
 bool binaryMode = false;
-uint8_t displayItem = 0;  // 0:気温 1:湿度 2:気圧
+size_t displayItem = 0;            // 次にマトリクスに流す値 (sensors.metric の番号)
+size_t lastShownItem = SIZE_MAX;   // 直前に流した値。番号が戻ったら 1 周したとみなす
 
 Settings settings;
+Uploader uploader;
 bool networkStarted = false;
 DNSServer dnsServer;
-bool apMode = false;          // セットアップ用アクセスポイントを出している
-bool staRetryInAp = false;    // AP 中も保存済みの Wi-Fi への再接続を試みる
+bool apMode = false;        // セットアップ用アクセスポイントを出している
+bool staRetryInAp = false;  // AP 中も保存済みの Wi-Fi への再接続を試みる
 uint32_t lastStaRetryMs = 0;
 char apSsid[32] = "";
-uint32_t restartAtMs = 0;     // 0 以外ならこの時刻に再起動
+uint32_t restartAtMs = 0;  // 0 以外ならこの時刻に再起動
 
-QueueHandle_t uploadQueue;
-SemaphoreHandle_t uploadMutex;  // uploadStatus と settings.gasUrl / gasToken (送信タスクも読む) を守る
-UploadStatus uploadStatus;
 bool uploadedOnce = false;
 uint32_t lastUploadMs = 0;
 long lastUploadSlot = -1;
@@ -122,67 +96,23 @@ uint32_t uptimeSec() { return millis() / 1000; }
 
 bool timeSynced(time_t now) { return now > 1700000000; }
 
-String jsonString(const String& value) {
-  String out = "\"";
-  for (const char* p = value.c_str(); *p; ++p) {
-    if (*p == '"' || *p == '\\') {
-      out += '\\';
-      out += *p;
-    } else if ((uint8_t)*p < 0x20) {
-      char esc[8];
-      snprintf(esc, sizeof(esc), "\\u%04x", *p);
-      out += esc;
-    } else {
-      out += *p;
-    }
-  }
-  return out + "\"";
+String colorHex(uint32_t color) {
+  char hex[8];
+  snprintf(hex, sizeof(hex), "#%06lx", (unsigned long)color);
+  return hex;
 }
 
 // ---------------------------------------------------------------- sensor
 
-bool initSensors() {
-  bool shtOk = sht3x.begin(&Wire, SHT3X_I2C_ADDR, PIN_SDA, PIN_SCL, 400000U);
-  bool qmpOk = qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, PIN_SDA, PIN_SCL, 400000U);
-  Serial.printf("[sensor] SHT30:%s QMP6988:%s\n", shtOk ? "ok" : "NG", qmpOk ? "ok" : "NG");
-  return shtOk && qmpOk;
-}
-
-void readSensors() {
-  if (!sensorOk) {
-    if (millis() - lastSensorInitMs < 5000) return;
-    lastSensorInitMs = millis();
-    sensorOk = initSensors();
-    if (!sensorOk) return;
-    sensorFailures = 0;
-  }
-
-  bool shtOk = sht3x.update();
-  qmp.update();
-  float hPa = qmp.pressure / 100.0f;
-  if (!shtOk || hPa < 300 || hPa > 1100) {
-    Serial.println("[sensor] read failed");
-    if (++sensorFailures >= 3) {
-      sensorOk = false;
-      reading.valid = false;
-    }
-    return;
-  }
-  sensorFailures = 0;
-  reading.temperature = sht3x.cTemp;
-  reading.humidity = sht3x.humidity;
-  reading.pressure = hPa;
-  reading.valid = true;
-}
-
 void recordHistory() {
-  if (!reading.valid) return;
+  if (!sensors.anyValid()) return;
   uint32_t now = uptimeSec();
-  if (historyCount > 0 && now - lastHistorySec < HISTORY_INTERVAL_SEC) return;
+  if (historyStarted && now - lastHistorySec < HISTORY_INTERVAL_SEC) return;
+  historyStarted = true;
   lastHistorySec = now;
-  history[historyHead] = {now, reading.temperature, reading.humidity, reading.pressure};
-  historyHead = (historyHead + 1) % HISTORY_SIZE;
-  if (historyCount < HISTORY_SIZE) ++historyCount;
+  float values[SensorHub::kMaxMetrics];
+  for (size_t i = 0; i < sensors.metricCount(); ++i) values[i] = sensors.metric(i).value;
+  history.record(now, values);
 }
 
 // ---------------------------------------------------------------- display
@@ -202,52 +132,51 @@ void formatBinary(char* out, size_t size, long value, const char* unit) {
   strlcat(out, unit, size);
 }
 
-void formatValue(char* out, size_t size, float value, const char* unit) {
+void formatValue(char* out, size_t size, const Metric& m) {
   if (binaryMode) {
-    formatBinary(out, size, lroundf(value), unit);
+    formatBinary(out, size, lroundf(m.value), m.matrixUnit);
   } else {
-    snprintf(out, size, "%.1f%s", value, unit);
+    snprintf(out, size, "%.*f%s", m.decimals, m.value, m.matrixUnit);
   }
 }
 
 void refillDisplay(MatrixDisplay& d) {
-  if (!sensorOk) {
-    d.appendText("ERR", COLOR_ERROR);
+  if (!sensors.anyValid()) {
+    bool anyOk = false;
+    for (Sensor* s : sensors.sensors()) anyOk |= s->ok();
+    if (anyOk) {
+      d.appendText("...", COLOR_INFO);  // 見つかったが、まだ最初の値が読めていない
+    } else {
+      d.appendText("ERR", COLOR_ERROR);
+      d.appendGap(4);
+    }
+    return;
+  }
+
+  // 読めていない値・マトリクスに出さない値は飛ばして、次の値を流す
+  const size_t n = sensors.metricCount();
+  for (size_t tries = 0; tries < n; ++tries) {
+    size_t i = displayItem;
+    displayItem = (displayItem + 1) % n;
+    const Metric& m = sensors.metric(i);
+    if (!m.onMatrix || isnan(m.value)) continue;
+
+    if (apMode && (lastShownItem == SIZE_MAX || i <= lastShownItem)) {
+      d.appendText("AP", COLOR_INFO);
+      d.appendGap(3);
+    }
+    lastShownItem = i;
+    char text[48];
+    formatValue(text, sizeof(text), m);
+    d.appendText(text, m.color);
     d.appendGap(4);
     return;
   }
-  if (!reading.valid) {
-    d.appendText("...", COLOR_INFO);
-    return;
-  }
-  if (apMode && displayItem == 0) {
-    d.appendText("AP", COLOR_INFO);
-    d.appendGap(3);
-  }
-
-  char text[48];
-  uint32_t color;
-  switch (displayItem) {
-    case 0:
-      formatValue(text, sizeof(text), reading.temperature, "*C");
-      color = COLOR_TEMPERATURE;
-      break;
-    case 1:
-      formatValue(text, sizeof(text), reading.humidity, "%");
-      color = COLOR_HUMIDITY;
-      break;
-    default:
-      formatValue(text, sizeof(text), reading.pressure, "hPa");
-      color = COLOR_PRESSURE;
-      break;
-  }
-  displayItem = (displayItem + 1) % 3;
-  d.appendText(text, color);
-  d.appendGap(4);
 }
 
 void restartScroll() {
   displayItem = 0;
+  lastShownItem = SIZE_MAX;
   display.clear();
 }
 
@@ -279,145 +208,19 @@ void showIp() {
 
 // ---------------------------------------------------------------- upload
 
-void setUploadStatus(bool ok, int code, const char* message) {
-  xSemaphoreTake(uploadMutex, portMAX_DELAY);
-  uploadStatus.lastAttemptSec = uptimeSec();
-  uploadStatus.lastCode = code;
-  if (ok) {
-    uploadStatus.lastSuccessSec = uploadStatus.lastAttemptSec;
-    ++uploadStatus.successCount;
-  } else {
-    ++uploadStatus.failureCount;
-  }
-  // JSON にそのまま埋め込むので、引用符や制御文字は落としておく
-  size_t n = 0;
-  for (const char* p = message; *p && n + 1 < sizeof(uploadStatus.message); ++p) {
-    if (*p == '"' || *p == '\\' || (uint8_t)*p < 0x20) continue;
-    uploadStatus.message[n++] = *p;
-  }
-  uploadStatus.message[n] = '\0';
-  xSemaphoreGive(uploadMutex);
-}
-
-enum class UploadResult {
-  kOk,
-  kRejected,  // GAS には届いたが拒否された (合言葉違いなど)。再送しても変わらない
-  kFailed,    // 通信エラーなど。再送する
-};
-
-// GAS の doPost の結果ページ (302 の Location) を取りに行く
-int fetchGasResult(const String& location, String& response) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(20000);
-  if (!http.begin(client, location)) return HTTPC_ERROR_CONNECTION_REFUSED;
-  int code = http.GET();
-  response = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-  http.end();
-  return code;
-}
-
-UploadResult postToGas(const Reading& r) {
-  if (!WiFi.isConnected()) {
-    setUploadStatus(false, 0, "wifi disconnected");
-    return UploadResult::kFailed;
-  }
-
-  xSemaphoreTake(uploadMutex, portMAX_DELAY);
-  String url = settings.gasUrl;
-  String token = settings.gasToken;
-  xSemaphoreGive(uploadMutex);
-  if (url.isEmpty()) {
-    setUploadStatus(false, 0, "GAS URL is not set");
-    return UploadResult::kRejected;
-  }
-
-  char body[384];
-  snprintf(body, sizeof(body),
-           "{\"token\":%s,\"device\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
-           "\"pressure\":%.2f,\"rssi\":%d,\"uptime\":%lu}",
-           jsonString(token).c_str(), DEVICE_NAME, r.temperature, r.humidity, r.pressure, WiFi.RSSI(),
-           (unsigned long)uptimeSec());
-
-  // GAS は doPost を実行してから 302 で結果の URL を返す。HTTPClient に自動で追わせると
-  // POST 用の Content-Type を付けたまま GET してしまい 400 になるので、結果は別リクエストで取る。
-  int code;
-  String response;
-  String location;
-  {
-    WiFiClientSecure client;
-    client.setInsecure();  // 証明書の検証は省略 (送るのは測定値のみ)
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    http.setTimeout(20000);
-    const char* headerKeys[] = {"Location"};
-    http.collectHeaders(headerKeys, 1);
-    if (!http.begin(client, url)) {
-      setUploadStatus(false, 0, "invalid GAS URL");
-      return UploadResult::kRejected;
-    }
-    http.addHeader("Content-Type", "application/json");
-    code = http.POST((uint8_t*)body, strlen(body));
-    if (code == HTTP_CODE_FOUND || code == HTTP_CODE_SEE_OTHER) {
-      location = http.header("Location");
-    } else {
-      response = code > 0 ? http.getString() : HTTPClient::errorToString(code);
-    }
-    http.end();
-  }
-
-  if (location.length() > 0) {
-    int resultCode = fetchGasResult(location, response);
-    Serial.printf("[upload] 302 -> %d %s\n", resultCode, response.substring(0, 120).c_str());
-    if (resultCode != HTTP_CODE_OK) {
-      // 302 が返った時点で doPost は実行済み。再送すると行が重複するので成功扱いにする
-      setUploadStatus(true, code, "ok (result not read)");
-      return UploadResult::kOk;
-    }
-    code = resultCode;
-  } else {
-    Serial.printf("[upload] code=%d %s\n", code, response.substring(0, 120).c_str());
-  }
-
-  if (code == HTTP_CODE_OK && response.indexOf("\"ok\":true") >= 0) {
-    setUploadStatus(true, code, "ok");
-    return UploadResult::kOk;
-  }
-  // HTML のエラーページはそのまま見せても読めないので要約する
-  String message = response.startsWith("<") ? "HTTP " + String(code) + " (html)" : response.substring(0, 90);
-  setUploadStatus(false, code, message.c_str());
-  return code == HTTP_CODE_OK ? UploadResult::kRejected : UploadResult::kFailed;
-}
-
-void uploadTask(void*) {
-  Reading r;
-  for (;;) {
-    if (xQueueReceive(uploadQueue, &r, portMAX_DELAY) != pdTRUE) continue;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-      if (postToGas(r) != UploadResult::kFailed) break;
-      // 30秒待って再送。新しい送信要求が来たらそちらを優先する。
-      Reading newer;
-      if (xQueuePeek(uploadQueue, &newer, pdMS_TO_TICKS(30000)) == pdTRUE) break;
-    }
-  }
-}
-
 void requestUpload() {
-  if (settings.gasUrl.isEmpty()) {
-    setUploadStatus(false, 0, "GAS URL is not set");
-    return;
-  }
-  if (!reading.valid) {
-    setUploadStatus(false, 0, "no sensor reading");
-    return;
-  }
-  xQueueOverwrite(uploadQueue, &reading);
+  if (!settings.hasGasTarget() || !sensors.anyValid()) return;
+  UploadSnapshot snapshot;
+  snapshot.count = sensors.metricCount();
+  for (size_t i = 0; i < snapshot.count; ++i) snapshot.values[i] = sensors.metric(i).value;
+  snapshot.rssi = WiFi.RSSI();
+  snapshot.uptimeSec = uptimeSec();
+  uploader.request(snapshot);
 }
 
 // NTP 同期後は間隔ちょうど (10分なら xx:00, xx:10, ...) に送る。同期前は起動からの経過で送る。
 void scheduleUpload() {
-  if (!reading.valid || !WiFi.isConnected()) return;
+  if (!sensors.anyValid() || !WiFi.isConnected()) return;
   const uint32_t interval = settings.uploadIntervalSec();
 
   time_t now = time(nullptr);
@@ -447,57 +250,62 @@ long secondsUntilNextUpload() {
 
 // ---------------------------------------------------------------- web
 
-// NAN は JSON の null にする
-const char* num(char* buf, size_t size, float value, int decimals) {
-  if (isnan(value)) return "null";
-  snprintf(buf, size, "%.*f", decimals, value);
-  return buf;
+void sendJson(const String& json) { server.send(200, "application/json", json); }
+
+void sendError(const char* message) {
+  server.send(400, "application/json", "{\"ok\":false,\"error\":" + jsonString(message) + "}");
 }
 
-void sendJson(const char* json) { server.send(200, "application/json", json); }
-
 void handleStatus() {
-  UploadStatus up;
-  xSemaphoreTake(uploadMutex, portMAX_DELAY);
-  up = uploadStatus;
-  xSemaphoreGive(uploadMutex);
+  String json;
+  json.reserve(2048);
+  json = "{\"device\":" + jsonString(DEVICE_NAME) + ",\"mode\":\"" + (binaryMode ? "binary" : "decimal") +
+         "\",\"brightness\":" + display.brightness() + ",\"maxBrightness\":" + MAX_BRIGHTNESS;
 
-  char t[16], h[16], p[16];
-  const bool v = reading.valid;
-  char json[1024];
-  snprintf(json, sizeof(json),
-           "{\"device\":\"%s\",\"sensorOk\":%s,\"valid\":%s,"
-           "\"temperature\":%s,\"humidity\":%s,\"pressure\":%s,"
-           "\"mode\":\"%s\",\"brightness\":%u,\"maxBrightness\":%u,"
-           "\"apMode\":%s,\"apSsid\":%s,\"ip\":\"%s\",\"ssid\":%s,\"rssi\":%d,\"mac\":\"%s\","
-           "\"uptime\":%lu,\"epoch\":%ld,\"timeSynced\":%s,\"freeHeap\":%u,"
-           "\"upload\":{\"configured\":%s,\"intervalSec\":%lu,\"nextInSec\":%ld,"
-           "\"lastAttempt\":%lu,\"lastSuccess\":%lu,\"lastCode\":%d,\"message\":\"%s\","
-           "\"successCount\":%lu,\"failureCount\":%lu}}",
-           DEVICE_NAME, sensorOk ? "true" : "false", v ? "true" : "false",
-           num(t, sizeof(t), v ? reading.temperature : NAN, 2), num(h, sizeof(h), v ? reading.humidity : NAN, 2),
-           num(p, sizeof(p), v ? reading.pressure : NAN, 2), binaryMode ? "binary" : "decimal",
-           display.brightness(), MAX_BRIGHTNESS, apMode ? "true" : "false", jsonString(apSsid).c_str(),
-           (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString().c_str(), jsonString(WiFi.SSID()).c_str(),
-           WiFi.RSSI(), WiFi.macAddress().c_str(), (unsigned long)uptimeSec(), (long)time(nullptr),
-           timeSynced(time(nullptr)) ? "true" : "false", ESP.getFreeHeap(), settings.gasUrl.isEmpty() ? "false" : "true",
-           (unsigned long)settings.uploadIntervalSec(), secondsUntilNextUpload(), (unsigned long)up.lastAttemptSec,
-           (unsigned long)up.lastSuccessSec, up.lastCode, up.message, (unsigned long)up.successCount,
-           (unsigned long)up.failureCount);
+  json += ",\"sensors\":[";
+  for (size_t i = 0; i < sensors.sensors().size(); ++i) {
+    Sensor* s = sensors.sensors()[i];
+    json += String(i ? "," : "") + "{\"name\":" + jsonString(s->name()) + ",\"ok\":" + (s->ok() ? "true" : "false") + "}";
+  }
+  json += "],\"metrics\":[";
+  for (size_t i = 0; i < sensors.metricCount(); ++i) {
+    const Metric& m = sensors.metric(i);
+    json += String(i ? "," : "") + "{\"key\":" + jsonString(m.key) + ",\"label\":" + jsonString(m.label) +
+            ",\"unit\":" + jsonString(m.unit) + ",\"decimals\":" + m.decimals + ",\"color\":\"" + colorHex(m.color) +
+            "\",\"value\":" + jsonNumber(m.value, m.decimals + 1) + "}";
+  }
+
+  const time_t now = time(nullptr);
+  json += "],\"apMode\":" + String(apMode ? "true" : "false") + ",\"apSsid\":" + jsonString(apSsid) + ",\"ip\":\"" +
+          (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString() + "\",\"ssid\":" + jsonString(WiFi.SSID()) +
+          ",\"rssi\":" + WiFi.RSSI() + ",\"mac\":\"" + WiFi.macAddress() + "\",\"uptime\":" + uptimeSec() +
+          ",\"epoch\":" + String((long)now) + ",\"timeSynced\":" + (timeSynced(now) ? "true" : "false") +
+          ",\"freeHeap\":" + ESP.getFreeHeap();
+
+  json += ",\"upload\":{\"intervalSec\":" + String(settings.uploadIntervalSec()) +
+          ",\"nextInSec\":" + secondsUntilNextUpload() + ",\"targets\":[";
+  std::vector<TargetStatus> statuses = uploader.statuses();
+  for (size_t i = 0; i < settings.gasTargets.size(); ++i) {
+    const GasTarget& t = settings.gasTargets[i];
+    TargetStatus s = i < statuses.size() ? statuses[i] : TargetStatus{};
+    json += String(i ? "," : "") + "{\"name\":" + jsonString(t.name) +
+            ",\"configured\":" + (t.url.isEmpty() ? "false" : "true") + ",\"lastAttempt\":" + s.lastAttemptSec +
+            ",\"lastSuccess\":" + s.lastSuccessSec + ",\"lastCode\":" + s.lastCode +
+            ",\"message\":" + jsonString(s.message) + ",\"successCount\":" + s.successCount +
+            ",\"failureCount\":" + s.failureCount + "}";
+  }
+  json += "]}}";
   sendJson(json);
 }
 
-// 履歴は大きいのでチャンクに分けて送る。each(entry, buf, size) が 1 行分を書く。
+// 履歴は大きいのでチャンクに分けて送る。row(i) が i 行目の文字列を返す。
 template <typename RowWriter>
-void streamHistory(const char* contentType, const char* header, const char* footer, RowWriter each) {
+void streamHistory(const char* contentType, const String& header, const char* footer, RowWriter row) {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, contentType, "");
   String chunk = header;
-  size_t start = (historyHead + HISTORY_SIZE - historyCount) % HISTORY_SIZE;
-  char line[96];
-  for (size_t i = 0; i < historyCount; ++i) {
-    each(history[(start + i) % HISTORY_SIZE], i == 0, line, sizeof(line));
-    chunk += line;
+  for (size_t i = 0; i < history.size(); ++i) {
+    chunk += row(i);
     if (chunk.length() > 1200) {
       server.sendContent(chunk);
       chunk = "";
@@ -509,33 +317,44 @@ void streamHistory(const char* contentType, const char* header, const char* foot
 }
 
 void handleHistory() {
-  char header[128];
-  snprintf(header, sizeof(header), "{\"uptime\":%lu,\"epoch\":%ld,\"intervalSec\":%lu,\"rows\":[",
-           (unsigned long)uptimeSec(), (long)time(nullptr), (unsigned long)HISTORY_INTERVAL_SEC);
-  streamHistory("application/json", header, "]}", [](const HistoryEntry& e, bool first, char* buf, size_t size) {
-    snprintf(buf, size, "%s[%lu,%.2f,%.2f,%.2f]", first ? "" : ",", (unsigned long)e.uptimeSec, e.temperature,
-             e.humidity, e.pressure);
+  String header = "{\"uptime\":" + String(uptimeSec()) + ",\"epoch\":" + String((long)time(nullptr)) +
+                  ",\"intervalSec\":" + String(HISTORY_INTERVAL_SEC) + ",\"keys\":[";
+  for (size_t m = 0; m < sensors.metricCount(); ++m) header += String(m ? "," : "") + jsonString(sensors.metric(m).key);
+  header += "],\"rows\":[";
+  streamHistory("application/json", header, "]}", [](size_t i) {
+    String line = String(i ? ",[" : "[") + history.time(i);
+    for (size_t m = 0; m < sensors.metricCount(); ++m) {
+      line += "," + jsonNumber(history.value(i, m), sensors.metric(m).decimals + 1);
+    }
+    return line + "]";
   });
 }
 
 void handleCsv() {
-  server.sendHeader("Content-Disposition", "attachment; filename=\"env3_history.csv\"");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + String(DEVICE_NAME) + "_history.csv\"");
   const uint32_t nowUp = uptimeSec();
   const time_t now = time(nullptr);
   const bool synced = timeSynced(now);
-  streamHistory("text/csv", synced ? "time,temperature,humidity,pressure\n" : "uptime_sec,temperature,humidity,pressure\n",
-                "", [=](const HistoryEntry& e, bool, char* buf, size_t size) {
-                  char when[24];
-                  if (synced) {
-                    time_t at = now - (nowUp - e.uptimeSec);
-                    struct tm tm;
-                    localtime_r(&at, &tm);
-                    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
-                  } else {
-                    snprintf(when, sizeof(when), "%lu", (unsigned long)e.uptimeSec);
-                  }
-                  snprintf(buf, size, "%s,%.2f,%.2f,%.2f\n", when, e.temperature, e.humidity, e.pressure);
-                });
+  String header = synced ? "timestamp" : "uptime_sec";
+  for (size_t m = 0; m < sensors.metricCount(); ++m) header += String(",") + sensors.metric(m).key;
+  header += "\n";
+  streamHistory("text/csv", header, "", [=](size_t i) {
+    char when[24];
+    if (synced) {
+      time_t at = now - (nowUp - history.time(i));
+      struct tm tm;
+      localtime_r(&at, &tm);
+      strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
+    } else {
+      snprintf(when, sizeof(when), "%lu", (unsigned long)history.time(i));
+    }
+    String line = when;
+    for (size_t m = 0; m < sensors.metricCount(); ++m) {
+      float v = history.value(i, m);
+      line += "," + (isnan(v) ? String("") : String(v, (unsigned int)sensors.metric(m).decimals + 1));
+    }
+    return line + "\n";
+  });
 }
 
 void handleMatrix() {
@@ -559,10 +378,7 @@ void handleMode() {
 }
 
 void handleBrightness() {
-  if (!server.hasArg("value")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"value is required\"}");
-    return;
-  }
+  if (!server.hasArg("value")) return sendError("value is required");
   setBrightness(server.arg("value").toInt());
   sendJson("{\"ok\":true}");
 }
@@ -577,17 +393,25 @@ bool authorized() {
 void handleSettingsGet() {
   if (!authorized()) return;
   String json = "{\"wifiSsid\":" + jsonString(settings.wifiSsid) +
-                ",\"hasWifiPassword\":" + (settings.wifiPassword.isEmpty() ? "false" : "true") +
-                ",\"gasUrl\":" + jsonString(settings.gasUrl) + ",\"gasToken\":" + jsonString(settings.gasToken) +
-                ",\"hasAdminPassword\":" + (settings.adminPassword.isEmpty() ? "false" : "true") +
-                ",\"uploadIntervalMin\":" + settings.uploadIntervalMin + ",\"apMode\":" + (apMode ? "true" : "false") +
-                ",\"apSsid\":" + jsonString(apSsid) + ",\"device\":" + jsonString(DEVICE_NAME) + "}";
-  sendJson(json.c_str());
+                ",\"hasWifiPassword\":" + (settings.wifiPassword.isEmpty() ? "false" : "true") + ",\"gasTargets\":[";
+  for (size_t i = 0; i < settings.gasTargets.size(); ++i) {
+    const GasTarget& t = settings.gasTargets[i];
+    json += String(i ? "," : "") + "{\"name\":" + jsonString(t.name) + ",\"url\":" + jsonString(t.url) +
+            ",\"token\":" + jsonString(t.token) + "}";
+  }
+  json += "],\"maxGasTargets\":" + String(Settings::kMaxGasTargets) +
+          ",\"hasAdminPassword\":" + (settings.adminPassword.isEmpty() ? "false" : "true") +
+          ",\"uploadIntervalMin\":" + settings.uploadIntervalMin + ",\"apMode\":" + (apMode ? "true" : "false") +
+          ",\"apSsid\":" + jsonString(apSsid) + ",\"device\":" + jsonString(DEVICE_NAME) + "}";
+  sendJson(json);
 }
 
-void sendError(const char* message) {
-  String json = "{\"ok\":false,\"error\":" + jsonString(message) + "}";
-  server.send(400, "application/json", json);
+bool sameTargets(const std::vector<GasTarget>& a, const std::vector<GasTarget>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].name != b[i].name || a[i].url != b[i].url || a[i].token != b[i].token) return false;
+  }
+  return true;
 }
 
 void handleSettingsPost() {
@@ -599,32 +423,42 @@ void handleSettingsPost() {
   // SSID を変えたときはパスワードも入れ直し (空ならオープンなネットワーク)。同じ SSID で空欄なら据え置き。
   String wifiPassword = server.arg("wifiPassword");
   if (next.wifiSsid != settings.wifiSsid || wifiPassword.length() > 0) next.wifiPassword = wifiPassword;
-  next.gasUrl = server.arg("gasUrl");
-  next.gasUrl.trim();
-  next.gasToken = server.arg("gasToken");
-  next.gasToken.trim();
   String adminPassword = server.arg("adminPassword");
   if (adminPassword.length() > 0) next.adminPassword = adminPassword;
   if (server.hasArg("clearAdminPassword")) next.adminPassword = "";
   long interval = server.arg("uploadIntervalMin").toInt();
 
+  // 送信先は gasName<i> / gasUrl<i> / gasToken<i> (i = 0 .. gasCount-1)
+  long count = server.arg("gasCount").toInt();
+  if (count < 1 || count > (long)Settings::kMaxGasTargets) return sendError("送信先は 1〜10 件にしてください");
+  next.gasTargets.clear();
+  for (long i = 0; i < count; ++i) {
+    GasTarget t{server.arg("gasName" + String(i)), server.arg("gasUrl" + String(i)), server.arg("gasToken" + String(i))};
+    t.name.trim();
+    t.url.trim();
+    t.token.trim();
+    String label = "送信先 " + String(i + 1) + ": ";
+    if (t.name.length() > 32) return sendError((label + "名前は 32 文字以内にしてください").c_str());
+    if (t.url.length() > 0 && !t.url.startsWith("https://"))
+      return sendError((label + "URL は https:// で始まる必要があります").c_str());
+    if (t.url.length() > 256) return sendError((label + "URL が長すぎます").c_str());
+    if (t.token.length() > 64) return sendError((label + "合言葉は 64 文字以内にしてください").c_str());
+    next.gasTargets.push_back(t);
+  }
+
   if (next.wifiSsid.length() > 32) return sendError("SSID は 32 文字以内にしてください");
   if (next.wifiPassword.length() > 63 || (next.wifiPassword.length() > 0 && next.wifiPassword.length() < 8))
     return sendError("Wi-Fi パスワードは 8〜63 文字にしてください");
-  if (next.gasUrl.length() > 0 && !next.gasUrl.startsWith("https://"))
-    return sendError("GAS の URL は https:// で始まる必要があります");
-  if (next.gasUrl.length() > 256) return sendError("GAS の URL が長すぎます");
-  if (next.gasToken.length() > 64) return sendError("合言葉は 64 文字以内にしてください");
   if (next.adminPassword.length() > 64) return sendError("管理パスワードは 64 文字以内にしてください");
   if (interval < 1 || interval > 60) return sendError("送信間隔は 1〜60 分にしてください");
   next.uploadIntervalMin = interval;
 
   const bool wifiChanged = next.wifiSsid != settings.wifiSsid || next.wifiPassword != settings.wifiPassword;
+  const bool targetsChanged = !sameTargets(next.gasTargets, settings.gasTargets);
   const bool intervalChanged = next.uploadIntervalMin != settings.uploadIntervalMin;
   saveSettings(next);
-  xSemaphoreTake(uploadMutex, portMAX_DELAY);
   settings = next;
-  xSemaphoreGive(uploadMutex);
+  if (targetsChanged) uploader.setTargets(settings.gasTargets);
   ArduinoOTA.setPassword(settings.adminPassword.c_str());
   if (intervalChanged) lastUploadSlot = -1;  // 新しい間隔の区切りで送り直す
 
@@ -653,7 +487,7 @@ void handleScan() {
   }
   WiFi.scanDelete();
   json += "]";
-  sendJson(json.c_str());
+  sendJson(json);
 }
 
 void handleReset() {
@@ -698,6 +532,8 @@ void setupWebServer() {
   });
   server.begin();
 }
+
+// ---------------------------------------------------------------- network
 
 // Wi-Fi に初めてつながったときに mDNS と OTA を立ち上げる
 void startNetworkServices() {
@@ -762,13 +598,13 @@ void setup() {
   const bool forceSetup = digitalRead(PIN_BUTTON) == LOW;  // ボタンを押しながら起動でセットアップモード
   loadSettings(settings);
 
-  uploadMutex = xSemaphoreCreateMutex();
-  uploadQueue = xQueueCreate(1, sizeof(Reading));
-  xTaskCreatePinnedToCore(uploadTask, "upload", 12288, nullptr, 1, nullptr, 0);
+  sensors.add(&env3);
+  history.begin(sensors.metricCount(), HISTORY_SIZE);
+  sensors.poll(millis());
+  lastSensorReadMs = millis();
 
-  lastSensorInitMs = millis();
-  sensorOk = initSensors();
-  lastSensorReadMs = millis();  // 最初の変換が終わるのを待ってから読む
+  uploader.begin(sensors, DEVICE_NAME);
+  uploader.setTargets(settings.gasTargets);
 
   WiFi.persistent(false);  // 接続情報は settings 側で保存する
   WiFi.setHostname(DEVICE_NAME);
@@ -812,7 +648,7 @@ void loop() {
 
   if (nowMs - lastSensorReadMs >= SENSOR_INTERVAL_MS) {
     lastSensorReadMs = nowMs;
-    readSensors();
+    sensors.poll(nowMs);
     recordHistory();
   }
   scheduleUpload();
