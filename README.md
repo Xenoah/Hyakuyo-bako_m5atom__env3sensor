@@ -22,6 +22,8 @@ ENV III を Atom Matrix の Grove ポートに挿すだけです (SDA=G26, SCL=G
 
 - **ボタンをクリック**: 10進数 / 2進数 を切り替え (2進数は整数に四捨五入した値)。設定は再起動後も保持されます。
 - **ボタンを長押し (1秒)**: IP アドレスを白で流します。起動して Wi-Fi につながったときにも 1 回流れます。
+- **ボタンを押しながら起動**: セットアップモード (下記) で起動します。
+- セットアップモード中は各周回の頭に白で `AP` が流れます。
 - センサーが見つからないときは赤で `ERR` を流します。
 
 ## セットアップ
@@ -41,23 +43,39 @@ ENV III を Atom Matrix の Grove ポートに挿すだけです (SDA=G26, SCL=G
 
 > Code.gs を書き換えたときは「デプロイを管理 > 編集 > バージョン: 新バージョン」で更新すると URL が変わりません。
 
-### 2. secrets.h
-
-```sh
-cp include/secrets.example.h include/secrets.h
-```
-
-`WIFI_SSID` / `WIFI_PASSWORD` / `GAS_URL` / `GAS_TOKEN` (手順 3 で設定した場合) を書き換えます。
-`secrets.h` は `.gitignore` 済みです。ESP32 は 2.4GHz の Wi-Fi にしかつながりません。
-
-### 3. ビルドと書き込み
+### 2. ビルドと書き込み
 
 ```sh
 pio run -e m5atom-matrix -t upload
 pio device monitor
 ```
 
-一度 USB で書き込んだ後は Wi-Fi 経由でも書き込めます (`OTA_PASSWORD` を設定したら [platformio.ini](platformio.ini) の `--auth` も合わせる)。
+### 3. ブラウザから設定 (セットアップモード)
+
+Wi-Fi が未設定、または 15 秒以内につながらないときは、本体がアクセスポイントになります。
+
+1. PC / スマホで Wi-Fi `env3-setup-XXXX` (パスワード `env3setup`) に接続する。
+2. 設定画面が自動で開かなければ `http://192.168.4.1/settings` を開く。
+3. Wi-Fi (「周辺のネットワークを探す」で選べます)、GAS の URL、合言葉、送信間隔を入力して保存。
+4. 本体が再起動して家の Wi-Fi につながります。PC / スマホを元の Wi-Fi に戻して `http://env3.local/` を開く。
+
+設定は本体のフラッシュ (NVS) に保存され、書き込み直しても消えません。
+つながっている状態でも、ダッシュボード右上の「設定」からいつでも変更できます (Wi-Fi を変えたときだけ再起動します)。
+保存済みの Wi-Fi につながらないときもセットアップモードになり、AP に誰もつないでいない間は 30 秒おきに再接続を試します。
+
+ESP32 は 2.4GHz の Wi-Fi にしかつながりません。
+
+#### 管理パスワード
+
+設定画面で管理パスワードを決めると、設定画面にユーザー名 `admin` で Basic 認証がかかり、OTA 書き込みのパスワードにもなります。
+未設定だと同じ LAN の誰でも設定を変えられるので、設定しておくのがおすすめです。
+
+#### secrets.h (任意)
+
+`include/secrets.example.h` を `include/secrets.h` にコピーして値を書くと、それが「まだ何も保存されていないとき」の初期値になります。
+複数台に同じ設定を入れたいとき向けです。設定画面の「設定を初期化」でもこの値に戻ります。
+
+Wi-Fi につながった後は Wi-Fi 経由でも書き込めます (管理パスワードを設定したら [platformio.ini](platformio.ini) の `--auth` も合わせる)。
 
 ```sh
 pio run -e m5atom-matrix-ota -t upload
@@ -73,6 +91,7 @@ pio run -e m5atom-matrix-ota -t upload
 - スプレッドシート送信の状態、次回送信までの時間、「今すぐ送信」
 - Wi-Fi 強度、稼働時間、空きメモリ
 - 履歴 CSV のダウンロード
+- 設定 (`/settings`): Wi-Fi、GAS の URL・合言葉、送信間隔、管理パスワード
 
 ### API
 
@@ -86,18 +105,26 @@ pio run -e m5atom-matrix-ota -t upload
 | POST | `/api/brightness?value=1..80` | 明るさ |
 | POST | `/api/upload` | 今すぐスプレッドシートへ送信 |
 | POST | `/api/showip` | マトリクスに IP を流す |
+| GET | `/api/settings` | 現在の設定 (パスワードは返さない) ※ |
+| POST | `/api/settings` | 設定を保存 (フォーム形式) ※ |
+| GET | `/api/scan` | 周辺の Wi-Fi 一覧 ※ |
+| POST | `/api/reset` | 保存した設定を消して再起動 ※ |
+
+※ 管理パスワードを設定している場合は Basic 認証 (ユーザー名 `admin`) が必要です。
 
 ## 送信タイミング
 
-NTP で時刻が合っていれば毎時 00, 10, 20 … 分ちょうどに送ります。時刻が合う前は起動直後に 1 回送り、以降 10 分おき。
+送信間隔は設定画面で 1〜60 分に変えられます (初期値 10 分)。
+NTP で時刻が合っていれば間隔ちょうど (10 分なら毎時 00, 10, 20 … 分) に送ります。時刻が合う前は起動直後に 1 回送り、以降は間隔おき。
 失敗したときは 30 秒おきに 2 回まで再送します。
 
 ## 設定の変更
 
-間隔・色・ピン・明るさの上限などは [include/config.h](include/config.h) にまとめています。
+色・ピン・明るさの上限・セットアップ用 AP のパスワードなどは [include/config.h](include/config.h) にまとめています。
 
 ## 補足
 
 - SHT30 は Atom 本体の熱を拾いやすいので、ケーブルで少し離して設置すると気温が正確になります。
 - マトリクスは明るくすると発熱するため、明るさの上限を 80/255 にしています。
 - GAS への HTTPS は証明書検証を省略しています (`setInsecure`)。送っているのは測定値と合言葉だけです。
+- セットアップ用 AP のパスワード `env3setup` は公開リポジトリに載っている値です。気になる場合は [include/config.h](include/config.h) の `SETUP_AP_PASSWORD` を変えてください。

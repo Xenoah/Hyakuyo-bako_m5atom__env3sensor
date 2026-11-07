@@ -2,10 +2,10 @@
 
 #include <Arduino.h>
 
+// secrets.h は設定の初期値。なければ空の値 (= 起動時にセットアップモード) になる。
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
-#warning "include/secrets.h not found - using secrets.example.h (copy it to secrets.h and edit)"
 #include "secrets.example.h"
 #endif
 
@@ -19,9 +19,12 @@ constexpr uint8_t PIN_BUTTON = 39;
 constexpr uint8_t PIN_SDA = 26;
 constexpr uint8_t PIN_SCL = 32;
 
+// Wi-Fi 未設定・接続失敗時に立ち上げるセットアップ用アクセスポイントのパスワード (8文字以上)
+constexpr char SETUP_AP_PASSWORD[] = "env3setup";
+
 constexpr uint32_t SENSOR_INTERVAL_MS = 2000;
-constexpr uint32_t UPLOAD_INTERVAL_SEC = 600;   // GAS への送信間隔 (10分)
-constexpr uint32_t HISTORY_INTERVAL_SEC = 60;   // Web 用履歴の記録間隔
+constexpr uint16_t DEFAULT_UPLOAD_INTERVAL_MIN = 10;  // GAS への送信間隔の初期値 (設定画面で変更可)
+constexpr uint32_t HISTORY_INTERVAL_SEC = 60;         // Web 用履歴の記録間隔
 constexpr size_t HISTORY_SIZE = 1440;           // 60秒 x 1440 = 24時間分
 
 constexpr uint16_t SCROLL_INTERVAL_MS = 90;

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <M5UnitENV.h>
@@ -11,6 +12,7 @@
 
 #include "config.h"
 #include "matrix_display.h"
+#include "settings.h"
 #include "web_page.h"
 
 namespace {
@@ -100,9 +102,17 @@ uint32_t lastHistorySec = 0;
 bool binaryMode = false;
 uint8_t displayItem = 0;  // 0:気温 1:湿度 2:気圧
 
+Settings settings;
 bool networkStarted = false;
+DNSServer dnsServer;
+bool apMode = false;          // セットアップ用アクセスポイントを出している
+bool staRetryInAp = false;    // AP 中も保存済みの Wi-Fi への再接続を試みる
+uint32_t lastStaRetryMs = 0;
+char apSsid[32] = "";
+uint32_t restartAtMs = 0;     // 0 以外ならこの時刻に再起動
+
 QueueHandle_t uploadQueue;
-SemaphoreHandle_t uploadMutex;
+SemaphoreHandle_t uploadMutex;  // uploadStatus と settings.gasUrl / gasToken (送信タスクも読む) を守る
 UploadStatus uploadStatus;
 bool uploadedOnce = false;
 uint32_t lastUploadMs = 0;
@@ -111,6 +121,23 @@ long lastUploadSlot = -1;
 uint32_t uptimeSec() { return millis() / 1000; }
 
 bool timeSynced(time_t now) { return now > 1700000000; }
+
+String jsonString(const String& value) {
+  String out = "\"";
+  for (const char* p = value.c_str(); *p; ++p) {
+    if (*p == '"' || *p == '\\') {
+      out += '\\';
+      out += *p;
+    } else if ((uint8_t)*p < 0x20) {
+      char esc[8];
+      snprintf(esc, sizeof(esc), "\\u%04x", *p);
+      out += esc;
+    } else {
+      out += *p;
+    }
+  }
+  return out + "\"";
+}
 
 // ---------------------------------------------------------------- sensor
 
@@ -193,6 +220,10 @@ void refillDisplay(MatrixDisplay& d) {
     d.appendText("...", COLOR_INFO);
     return;
   }
+  if (apMode && displayItem == 0) {
+    d.appendText("AP", COLOR_INFO);
+    d.appendGap(3);
+  }
 
   char text[48];
   uint32_t color;
@@ -234,7 +265,10 @@ void setBrightness(int value) {
 
 void showIp() {
   display.clear();
-  if (WiFi.isConnected()) {
+  if (apMode) {
+    display.appendText("AP ", COLOR_INFO);
+    display.appendText(WiFi.softAPIP().toString().c_str(), COLOR_INFO);
+  } else if (WiFi.isConnected()) {
     display.appendText("IP ", COLOR_INFO);
     display.appendText(WiFi.localIP().toString().c_str(), COLOR_INFO);
   } else {
@@ -271,11 +305,20 @@ bool postToGas(const Reading& r) {
     return false;
   }
 
-  char body[256];
+  xSemaphoreTake(uploadMutex, portMAX_DELAY);
+  String url = settings.gasUrl;
+  String token = settings.gasToken;
+  xSemaphoreGive(uploadMutex);
+  if (url.isEmpty()) {
+    setUploadStatus(false, 0, "GAS URL is not set");
+    return false;
+  }
+
+  char body[384];
   snprintf(body, sizeof(body),
-           "{\"token\":\"%s\",\"device\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
+           "{\"token\":%s,\"device\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,"
            "\"pressure\":%.2f,\"rssi\":%d,\"uptime\":%lu}",
-           GAS_TOKEN, DEVICE_NAME, r.temperature, r.humidity, r.pressure, WiFi.RSSI(),
+           jsonString(token).c_str(), DEVICE_NAME, r.temperature, r.humidity, r.pressure, WiFi.RSSI(),
            (unsigned long)uptimeSec());
 
   WiFiClientSecure client;
@@ -284,8 +327,8 @@ bool postToGas(const Reading& r) {
   // GAS は 302 でリダイレクトして結果を返すので GET で追いかける
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setTimeout(20000);
-  if (!http.begin(client, GAS_URL)) {
-    setUploadStatus(false, 0, "invalid GAS_URL");
+  if (!http.begin(client, url)) {
+    setUploadStatus(false, 0, "invalid GAS URL");
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -313,8 +356,8 @@ void uploadTask(void*) {
 }
 
 void requestUpload() {
-  if (strlen(GAS_URL) == 0) {
-    setUploadStatus(false, 0, "GAS_URL is not set");
+  if (settings.gasUrl.isEmpty()) {
+    setUploadStatus(false, 0, "GAS URL is not set");
     return;
   }
   if (!reading.valid) {
@@ -324,19 +367,20 @@ void requestUpload() {
   xQueueOverwrite(uploadQueue, &reading);
 }
 
-// NTP 同期後は 10 分ちょうど (xx:00, xx:10, ...) に送る。同期前は起動からの経過で送る。
+// NTP 同期後は間隔ちょうど (10分なら xx:00, xx:10, ...) に送る。同期前は起動からの経過で送る。
 void scheduleUpload() {
   if (!reading.valid || !WiFi.isConnected()) return;
+  const uint32_t interval = settings.uploadIntervalSec();
 
   time_t now = time(nullptr);
   if (timeSynced(now)) {
-    long slot = now / UPLOAD_INTERVAL_SEC;
-    if (lastUploadSlot < 0 && uploadedOnce && millis() - lastUploadMs < UPLOAD_INTERVAL_SEC * 1000UL) {
+    long slot = now / interval;
+    if (lastUploadSlot < 0 && uploadedOnce && millis() - lastUploadMs < interval * 1000UL) {
       lastUploadSlot = slot;  // 同期前に送ったばかりなら重複させない
     }
     if (slot == lastUploadSlot) return;
     lastUploadSlot = slot;
-  } else if (uploadedOnce && millis() - lastUploadMs < UPLOAD_INTERVAL_SEC * 1000UL) {
+  } else if (uploadedOnce && millis() - lastUploadMs < interval * 1000UL) {
     return;
   }
   uploadedOnce = true;
@@ -345,11 +389,12 @@ void scheduleUpload() {
 }
 
 long secondsUntilNextUpload() {
+  const long interval = settings.uploadIntervalSec();
   time_t now = time(nullptr);
-  if (timeSynced(now)) return (now / UPLOAD_INTERVAL_SEC + 1) * UPLOAD_INTERVAL_SEC - now;
+  if (timeSynced(now)) return (now / interval + 1) * interval - now;
   if (!uploadedOnce) return 0;
   long elapsed = (millis() - lastUploadMs) / 1000;
-  return max(0L, (long)UPLOAD_INTERVAL_SEC - elapsed);
+  return max(0L, interval - elapsed);
 }
 
 // ---------------------------------------------------------------- web
@@ -376,7 +421,7 @@ void handleStatus() {
            "{\"device\":\"%s\",\"sensorOk\":%s,\"valid\":%s,"
            "\"temperature\":%s,\"humidity\":%s,\"pressure\":%s,"
            "\"mode\":\"%s\",\"brightness\":%u,\"maxBrightness\":%u,"
-           "\"ip\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"mac\":\"%s\","
+           "\"apMode\":%s,\"apSsid\":%s,\"ip\":\"%s\",\"ssid\":%s,\"rssi\":%d,\"mac\":\"%s\","
            "\"uptime\":%lu,\"epoch\":%ld,\"timeSynced\":%s,\"freeHeap\":%u,"
            "\"upload\":{\"configured\":%s,\"intervalSec\":%lu,\"nextInSec\":%ld,"
            "\"lastAttempt\":%lu,\"lastSuccess\":%lu,\"lastCode\":%d,\"message\":\"%s\","
@@ -384,10 +429,11 @@ void handleStatus() {
            DEVICE_NAME, sensorOk ? "true" : "false", v ? "true" : "false",
            num(t, sizeof(t), v ? reading.temperature : NAN, 2), num(h, sizeof(h), v ? reading.humidity : NAN, 2),
            num(p, sizeof(p), v ? reading.pressure : NAN, 2), binaryMode ? "binary" : "decimal",
-           display.brightness(), MAX_BRIGHTNESS, WiFi.localIP().toString().c_str(), WiFi.SSID().c_str(),
+           display.brightness(), MAX_BRIGHTNESS, apMode ? "true" : "false", jsonString(apSsid).c_str(),
+           (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString().c_str(), jsonString(WiFi.SSID()).c_str(),
            WiFi.RSSI(), WiFi.macAddress().c_str(), (unsigned long)uptimeSec(), (long)time(nullptr),
-           timeSynced(time(nullptr)) ? "true" : "false", ESP.getFreeHeap(), strlen(GAS_URL) ? "true" : "false",
-           (unsigned long)UPLOAD_INTERVAL_SEC, secondsUntilNextUpload(), (unsigned long)up.lastAttemptSec,
+           timeSynced(time(nullptr)) ? "true" : "false", ESP.getFreeHeap(), settings.gasUrl.isEmpty() ? "false" : "true",
+           (unsigned long)settings.uploadIntervalSec(), secondsUntilNextUpload(), (unsigned long)up.lastAttemptSec,
            (unsigned long)up.lastSuccessSec, up.lastCode, up.message, (unsigned long)up.successCount,
            (unsigned long)up.failureCount);
   sendJson(json);
@@ -473,8 +519,112 @@ void handleBrightness() {
   sendJson("{\"ok\":true}");
 }
 
+// 管理パスワードが設定されていれば Basic 認証 (ユーザー名 admin) を求める
+bool authorized() {
+  if (settings.adminPassword.isEmpty() || server.authenticate("admin", settings.adminPassword.c_str())) return true;
+  server.requestAuthentication(BASIC_AUTH, DEVICE_NAME);
+  return false;
+}
+
+void handleSettingsGet() {
+  if (!authorized()) return;
+  String json = "{\"wifiSsid\":" + jsonString(settings.wifiSsid) +
+                ",\"hasWifiPassword\":" + (settings.wifiPassword.isEmpty() ? "false" : "true") +
+                ",\"gasUrl\":" + jsonString(settings.gasUrl) + ",\"gasToken\":" + jsonString(settings.gasToken) +
+                ",\"hasAdminPassword\":" + (settings.adminPassword.isEmpty() ? "false" : "true") +
+                ",\"uploadIntervalMin\":" + settings.uploadIntervalMin + ",\"apMode\":" + (apMode ? "true" : "false") +
+                ",\"apSsid\":" + jsonString(apSsid) + ",\"device\":" + jsonString(DEVICE_NAME) + "}";
+  sendJson(json.c_str());
+}
+
+void sendError(const char* message) {
+  String json = "{\"ok\":false,\"error\":" + jsonString(message) + "}";
+  server.send(400, "application/json", json);
+}
+
+void handleSettingsPost() {
+  if (!authorized()) return;
+
+  Settings next = settings;
+  next.wifiSsid = server.arg("wifiSsid");
+  next.wifiSsid.trim();
+  // SSID を変えたときはパスワードも入れ直し (空ならオープンなネットワーク)。同じ SSID で空欄なら据え置き。
+  String wifiPassword = server.arg("wifiPassword");
+  if (next.wifiSsid != settings.wifiSsid || wifiPassword.length() > 0) next.wifiPassword = wifiPassword;
+  next.gasUrl = server.arg("gasUrl");
+  next.gasUrl.trim();
+  next.gasToken = server.arg("gasToken");
+  next.gasToken.trim();
+  String adminPassword = server.arg("adminPassword");
+  if (adminPassword.length() > 0) next.adminPassword = adminPassword;
+  if (server.hasArg("clearAdminPassword")) next.adminPassword = "";
+  long interval = server.arg("uploadIntervalMin").toInt();
+
+  if (next.wifiSsid.length() > 32) return sendError("SSID は 32 文字以内にしてください");
+  if (next.wifiPassword.length() > 63 || (next.wifiPassword.length() > 0 && next.wifiPassword.length() < 8))
+    return sendError("Wi-Fi パスワードは 8〜63 文字にしてください");
+  if (next.gasUrl.length() > 0 && !next.gasUrl.startsWith("https://"))
+    return sendError("GAS の URL は https:// で始まる必要があります");
+  if (next.gasUrl.length() > 256) return sendError("GAS の URL が長すぎます");
+  if (next.gasToken.length() > 64) return sendError("合言葉は 64 文字以内にしてください");
+  if (next.adminPassword.length() > 64) return sendError("管理パスワードは 64 文字以内にしてください");
+  if (interval < 1 || interval > 60) return sendError("送信間隔は 1〜60 分にしてください");
+  next.uploadIntervalMin = interval;
+
+  const bool wifiChanged = next.wifiSsid != settings.wifiSsid || next.wifiPassword != settings.wifiPassword;
+  const bool intervalChanged = next.uploadIntervalMin != settings.uploadIntervalMin;
+  saveSettings(next);
+  xSemaphoreTake(uploadMutex, portMAX_DELAY);
+  settings = next;
+  xSemaphoreGive(uploadMutex);
+  ArduinoOTA.setPassword(settings.adminPassword.c_str());
+  if (intervalChanged) lastUploadSlot = -1;  // 新しい間隔の区切りで送り直す
+
+  // Wi-Fi を変えたとき、またはセットアップモード中は再起動してつなぎ直す
+  const bool restart = wifiChanged || apMode;
+  if (restart) restartAtMs = millis() + 1500;
+  sendJson(restart ? "{\"ok\":true,\"restart\":true}" : "{\"ok\":true,\"restart\":false}");
+}
+
+void handleScan() {
+  if (!authorized()) return;
+  int n = WiFi.scanNetworks();
+  String json = "[";
+  for (int i = 0; i < n; ++i) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty()) continue;
+    // 同じ SSID が複数見えたら一番強いものだけ返す
+    bool duplicate = false;
+    for (int j = 0; j < n && !duplicate; ++j) {
+      duplicate = j != i && WiFi.SSID(j) == ssid && (WiFi.RSSI(j) > WiFi.RSSI(i) || (WiFi.RSSI(j) == WiFi.RSSI(i) && j < i));
+    }
+    if (duplicate) continue;
+    if (json.length() > 1) json += ',';
+    json += "{\"ssid\":" + jsonString(ssid) + ",\"rssi\":" + WiFi.RSSI(i) +
+            ",\"secure\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "false" : "true") + "}";
+  }
+  WiFi.scanDelete();
+  json += "]";
+  sendJson(json.c_str());
+}
+
+void handleReset() {
+  if (!authorized()) return;
+  resetSettings();
+  restartAtMs = millis() + 1500;
+  sendJson("{\"ok\":true,\"restart\":true}");
+}
+
 void setupWebServer() {
   server.on("/", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); });
+  server.on("/style.css", HTTP_GET, [] { server.send_P(200, "text/css", STYLE_CSS); });
+  server.on("/settings", HTTP_GET, [] {
+    if (authorized()) server.send_P(200, "text/html; charset=utf-8", SETTINGS_HTML);
+  });
+  server.on("/api/settings", HTTP_GET, handleSettingsGet);
+  server.on("/api/settings", HTTP_POST, handleSettingsPost);
+  server.on("/api/scan", HTTP_GET, handleScan);
+  server.on("/api/reset", HTTP_POST, handleReset);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/history", HTTP_GET, handleHistory);
   server.on("/api/matrix", HTTP_GET, handleMatrix);
@@ -489,7 +639,15 @@ void setupWebServer() {
     showIp();
     sendJson("{\"ok\":true}");
   });
-  server.onNotFound([] { server.send(404, "text/plain", "not found"); });
+  server.onNotFound([] {
+    // セットアップモードではどの URL も設定画面へ (スマホのキャプティブポータル表示用)
+    if (apMode) {
+      server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/settings");
+      server.send(302, "text/plain", "");
+      return;
+    }
+    server.send(404, "text/plain", "not found");
+  });
   server.begin();
 }
 
@@ -499,10 +657,48 @@ void startNetworkServices() {
   Serial.printf("[wifi] connected: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin(DEVICE_NAME)) MDNS.addService("http", "tcp", 80);
   ArduinoOTA.setHostname(DEVICE_NAME);
-  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.setPassword(settings.adminPassword.c_str());
   ArduinoOTA.setMdnsEnabled(false);  // mDNS は上で開始済み
   ArduinoOTA.begin();
   showIp();
+}
+
+// Wi-Fi 未設定・接続失敗時のセットアップ用アクセスポイント。
+// retrySta が true なら、AP に誰もつないでいない間は保存済みの Wi-Fi への接続も試し続ける。
+void startSetupAp(bool retrySta) {
+  apMode = true;
+  staRetryInAp = retrySta;
+  lastStaRetryMs = millis();
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(apSsid, sizeof(apSsid), "%s-setup-%02X%02X", DEVICE_NAME, mac[4], mac[5]);
+  WiFi.setAutoReconnect(false);  // 自動再接続のチャンネル切り替えで AP が不安定になるので手動で試す
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apSsid, SETUP_AP_PASSWORD);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.printf("[wifi] setup AP: %s (%s)\n", apSsid, WiFi.softAPIP().toString().c_str());
+  showIp();
+}
+
+void stopSetupAp() {
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  apMode = false;
+  apSsid[0] = '\0';
+}
+
+void updateSetupAp(uint32_t nowMs) {
+  dnsServer.processNextRequest();
+  if (WiFi.isConnected()) {
+    stopSetupAp();
+    return;
+  }
+  if (staRetryInAp && WiFi.softAPgetStationNum() == 0 && nowMs - lastStaRetryMs >= 30000) {
+    lastStaRetryMs = nowMs;
+    WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
+  }
 }
 
 }  // namespace
@@ -515,6 +711,8 @@ void setup() {
   display.begin(prefs.getUChar("bright", DEFAULT_BRIGHTNESS), SCROLL_INTERVAL_MS);
   display.setRefill(refillDisplay);
   button.begin();
+  const bool forceSetup = digitalRead(PIN_BUTTON) == LOW;  // ボタンを押しながら起動でセットアップモード
+  loadSettings(settings);
 
   uploadMutex = xSemaphoreCreateMutex();
   uploadQueue = xQueueCreate(1, sizeof(Reading));
@@ -524,24 +722,31 @@ void setup() {
   sensorOk = initSensors();
   lastSensorReadMs = millis();  // 最初の変換が終わるのを待ってから読む
 
-  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);  // 接続情報は settings 側で保存する
   WiFi.setHostname(DEVICE_NAME);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   configTzTime(TZ_INFO, NTP_SERVER1, NTP_SERVER2);
 
-  // 最大 15 秒は接続を待つ。つながらなくても計測と表示は続け、裏で再接続させる。
-  uint32_t start = millis();
-  while (!WiFi.isConnected() && millis() - start < 15000) {
-    display.drawSpinner(millis(), COLOR_INFO);
-    delay(20);
+  const bool hasWifi = !settings.wifiSsid.isEmpty();
+  if (hasWifi && !forceSetup) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
+    // 最大 15 秒は接続を待つ。つながらなければセットアップ用 AP を出しつつ再接続を試し続ける。
+    uint32_t start = millis();
+    while (!WiFi.isConnected() && millis() - start < 15000) {
+      display.drawSpinner(millis(), COLOR_INFO);
+      delay(20);
+    }
   }
+  if (!WiFi.isConnected()) startSetupAp(hasWifi && !forceSetup);
   setupWebServer();
 }
 
 void loop() {
   const uint32_t nowMs = millis();
 
+  if (restartAtMs != 0 && (int32_t)(nowMs - restartAtMs) >= 0) ESP.restart();
+  if (apMode) updateSetupAp(nowMs);
   if (!networkStarted && WiFi.isConnected()) startNetworkServices();
   if (networkStarted) ArduinoOTA.handle();
   server.handleClient();
