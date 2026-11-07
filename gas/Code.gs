@@ -168,7 +168,17 @@ class Table_ {
     const wanted = keys ? String(keys).split(',').map((k) => k.trim()).filter(Boolean) : null;
     this.columns = header.filter((name) => !wanted || wanted.indexOf(name) >= 0 || name === TIME_COLUMN || name === DEVICE_COLUMN);
     this.colIndex = this.columns.map((name) => header.indexOf(name));
-    this.rows = values.slice(1).filter((r) => r[this.timeCol] instanceof Date && (!device || String(r[this.deviceCol]) === device));
+    const timeContext = sheetTimeContext_();
+    this.rows = [];
+    values.slice(1).forEach((row) => {
+      if (device && String(row[this.deviceCol]) !== device) return;
+      const time = parseSheetTime_(row[this.timeCol], timeContext);
+      if (time === null) return;
+      // 読み出し用のコピーだけを正規化する。シートや測定値は書き換えない。
+      const normalized = row.slice();
+      normalized[this.timeCol] = new Date(time);
+      this.rows.push(normalized);
+    });
     this.rows.sort((a, b) => a[this.timeCol] - b[this.timeCol]);
   }
   count() {
@@ -203,6 +213,75 @@ class Table_ {
     if (i === 0) return 0;
     if (i === n) return n - 1;
     return t - this.time(i - 1) <= this.time(i) - t ? i - 1 : i;
+  }
+}
+
+// instanceof は別の実行コンテキストの Date を除外するため、Date の内部値を確認する。
+// getTime を持つだけのオブジェクトや Invalid Date は日時として扱わない。
+function dateMillis_(value) {
+  try {
+    const time = Date.prototype.getTime.call(value);
+    return Number.isFinite(time) ? time : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function sheetTimeContext_() {
+  let timeZone = 'Etc/UTC';
+  let locale = '';
+  let spreadsheet = null;
+  try { timeZone = Session.getScriptTimeZone() || timeZone; } catch (err) {}
+  try { spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); } catch (err) {}
+  try { timeZone = spreadsheet.getSpreadsheetTimeZone() || timeZone; } catch (err) {}
+  try { locale = spreadsheet.getSpreadsheetLocale() || ''; } catch (err) {}
+  return { timeZone, locale: String(locale).replace(/-/g, '_').toLowerCase() };
+}
+
+// セルの Date / ISO 8601 / 年先頭の日時文字列を読む。
+// 月/日/年は en_US のシートだけで許可し、日/月/年との推測変換をしない。
+// 数値はシリアル値か UNIX 時刻か判別できないため、この読み出しでは採用しない。
+function parseSheetTime_(value, context) {
+  const dateTime = dateMillis_(value);
+  if (dateTime !== null) return dateTime;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  const zoned = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})$/);
+  const local = text.match(/^(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?$/);
+  const us = context.locale === 'en_us'
+    ? text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?$/)
+    : null;
+  let parts;
+  if (zoned) parts = zoned.slice(1, 8);
+  else if (local) parts = [local[1], local[3], local[4], local[5], local[6], local[7], local[8]];
+  else if (us) parts = [us[3], us[1], us[2], us[4], us[5], us[6], us[7]];
+  else return null;
+
+  const [year, month, day, hour, minute, second] = parts.slice(0, 6).map((v) => Number(v || 0));
+  const millis = Number((parts[6] || '').padEnd(3, '0'));
+  const pad = (n, width) => String(n).padStart(width, '0');
+  const canonical = pad(year, 4) + '-' + pad(month, 2) + '-' + pad(day, 2) + ' ' +
+    pad(hour, 2) + ':' + pad(minute, 2) + ':' + pad(second, 2) + '.' + pad(millis, 3);
+  const utc = Date.UTC(year, month - 1, day, hour, minute, second, millis);
+  // Date の自動繰り上がり (2/30, 24:00 など) を受け入れない。
+  if (new Date(utc).toISOString().slice(0, 23).replace('T', ' ') !== canonical) return null;
+
+  if (zoned) {
+    const zone = zoned[8];
+    if (zone === 'Z') return utc;
+    const hours = Number(zone.slice(1, 3));
+    const minutes = Number(zone.slice(4, 6));
+    if (hours > 23 || minutes > 59) return null;
+    return utc - (zone[0] === '-' ? -1 : 1) * (hours * 60 + minutes) * 60000;
+  }
+  try {
+    const pattern = 'yyyy-MM-dd HH:mm:ss.SSS';
+    const parsed = Utilities.parseDate(canonical, context.timeZone, pattern);
+    const time = dateMillis_(parsed);
+    // シートのタイムゾーンで往復し、存在しない現地時刻も除外する。
+    return time !== null && Utilities.formatDate(new Date(time), context.timeZone, pattern) === canonical ? time : null;
+  } catch (err) {
+    return null;
   }
 }
 
